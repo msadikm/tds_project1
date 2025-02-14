@@ -1,135 +1,183 @@
-import os
-import subprocess
-import json
+from fastapi import FastAPI, HTTPException, Query
+import uvicorn
 import sqlite3
-import duckdb
-import pandas as pd
+import os
 import requests
-import shutil
-from flask import Flask, request, jsonify, send_file
-from PIL import Image
+import subprocess
 import markdown
-import openai
-from datetime import datetime
+import duckdb
+import speech_recognition as sr
+from PIL import Image
+from git import Repo
 
-app = Flask(__name__)
-DATA_DIR = "./data"
+app = FastAPI()
+
+# Database path and AI Proxy settings
+db_path = "./data/task_history.db"
+AIPROXY_URL = "https://aiproxy.sanand.workers.dev/openai/v1/chat/completions"
 AIPROXY_TOKEN = os.getenv("AIPROXY_TOKEN")
-openai.api_key = AIPROXY_TOKEN
+if not AIPROXY_TOKEN:
+    raise ValueError("AIPROXY_TOKEN is not set in environment variables")
 
-def run_command(command):
-    """ Run a shell command securely. """
+# Initialize SQLite Database
+def init_db():
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    c.execute(
+        '''CREATE TABLE IF NOT EXISTS tasks (
+            id INTEGER PRIMARY KEY, 
+            task TEXT, 
+            status TEXT, 
+            output TEXT
+        )'''
+    )
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# Secure path validation to ensure access remains within "./data"
+def is_valid_path(path: str) -> bool:
+    abs_path = os.path.abspath(path)
+    allowed_base = os.path.abspath("./data")
+    return abs_path.startswith(allowed_base)
+
+# Function to execute shell commands safely
+def run_command(command: str):
+    tokens = command.split()
+    # Check if any token exactly equals "rm" or "unlink"
+    if "rm" in tokens or "unlink" in tokens:
+        raise HTTPException(status_code=400, detail="File deletion is not allowed")
+    
+    # Ensure command accesses only "./data/" by checking tokens individually
+    if not any(token.startswith("./data") for token in tokens):
+        raise HTTPException(status_code=400, detail="Access outside ./data is not allowed")
+    
     try:
-        result = subprocess.run(command, shell=True, capture_output=True, text=True)
-        return {"stdout": result.stdout, "stderr": result.stderr}
+        result = subprocess.run(command, shell=True, text=True, capture_output=True)
+        if result.returncode == 0:
+            return result.stdout.strip()
+        else:
+            raise Exception(result.stderr.strip())
     except Exception as e:
-        return {"error": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
 
-def run_sql(db_path, query):
-    """ Execute a safe SQL query. """
-    if not db_path.startswith("./data/"):
-        return {"error": "Unauthorized database access"}
-    if not query.strip().lower().startswith("select"):
-        return {"error": "Only SELECT queries allowed"}
+@app.post("/run")
+def run_task(task: str = Query(..., description="Task description in plain English")):
     try:
-        conn = sqlite3.connect(db_path) if db_path.endswith(".db") else duckdb.connect(db_path)
-        df = pd.read_sql(query, conn)
+        headers = {"Authorization": f"Bearer {AIPROXY_TOKEN}", "Content-Type": "application/json"}
+        data = {
+            "model": "gpt-4o-mini",
+            "messages": [
+                {"role": "system", "content": "You are an automation assistant. Generate only a single valid shell command."},
+                {"role": "user", "content": task}
+            ]
+        }
+        response = requests.post(AIPROXY_URL, json=data, headers=headers)
+        response_json = response.json()
+        print("AI Proxy response:", response_json)
+        if "choices" not in response_json:
+            raise HTTPException(status_code=response.status_code, detail=f"Invalid AI Proxy response: {response_json}")
+        
+        command = response_json["choices"][0]["message"]["content"].strip()
+
+        # Remove markdown code fences if present.
+        if command.startswith("```") and command.endswith("```"):
+            lines = command.splitlines()
+            # Remove the first and last lines containing the fences (and language tag, if any)
+            command = "\n".join(lines[1:-1]).strip()
+        
+        # Execute the shell command securely
+        output = run_command(command)
+        
+        # Store task result in SQLite
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+        c.execute("INSERT INTO tasks (task, status, output) VALUES (?, ?, ?)", (task, "success", output))
+        conn.commit()
         conn.close()
-        return df.to_dict()
-    except Exception as e:
-        return {"error": str(e)}
+        
+        return {"status": "success", "output": output}
+    except HTTPException as e:
+        return {"status": "error", "message": str(e.detail)}
 
-def resize_image(image_path, output_path, size=(256, 256)):
-    """ Resize an image and save it. """
-    try:
-        img = Image.open(image_path)
-        img = img.resize(size)
-        img.save(output_path)
-        return {"message": "Image resized"}
-    except Exception as e:
-        return {"error": str(e)}
 
-def transcribe_audio(audio_path):
-    """ Transcribe text from an MP3 file using OpenAI """
-    try:
-        with open(audio_path, "rb") as f:
-            transcript = openai.Audio.transcribe(model="whisper-1", file=f)
-        return {"text": transcript["text"]}
-    except Exception as e:
-        return {"error": str(e)}
-
-def convert_md_to_html(md_path, output_path):
-    """ Convert Markdown to HTML. """
-    try:
-        with open(md_path, "r") as f:
-            md_content = f.read()
-        html_content = markdown.markdown(md_content)
-        with open(output_path, "w") as f:
-            f.write(html_content)
-        return {"message": "Markdown converted"}
-    except Exception as e:
-        return {"error": str(e)}
-
-def count_wednesdays(input_file, output_file):
-    """ Count the number of Wednesdays in a given date file. """
-    date_formats = ["%Y-%m-%d", "%d-%b-%Y", "%Y/%m/%d %H:%M:%S", "%b %d, %Y"]
-    
-    def parse_date(date_str):
-        for fmt in date_formats:
-            try:
-                return datetime.strptime(date_str, fmt)
-            except ValueError:
-                continue
-        return None
+@app.get("/read")
+def read_file(path: str = Query(..., description="File path to read")):
+    if not is_valid_path(path):
+        raise HTTPException(status_code=400, detail="Access outside ./data is not allowed")
     
     try:
-        with open(input_file) as f:
-            count = sum(1 for line in f if (dt := parse_date(line.strip())) and dt.weekday() == 2)
-        with open(output_file, "w") as f:
-            f.write(str(count))
-        return {"message": "Counted Wednesdays"}
+        if not os.path.exists(path):
+            raise HTTPException(status_code=404, detail="File not found")
+        with open(path, "r") as file:
+            content = file.read()
+        return {"status": "success", "content": content}
     except Exception as e:
-        return {"error": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.route("/run", methods=["POST"])
-def run_task():
-    """ Run a predefined task. """
-    task = request.json.get("task")
-    
-    if task == "install_uv":
-        return run_command("pip install uv")
-    elif task == "format_markdown":
-        return run_command("npx prettier@3.4.2 --write ./data/format.md")
-    elif task == "count_wednesdays":
-        return count_wednesdays("./data/dates.txt", "./data/dates-wednesdays.txt")
-    elif task == "run_sql":
-        db_path = request.json.get("db_path")
-        query = request.json.get("query")
-        return run_sql(db_path, query)
-    elif task == "resize_image":
-        return resize_image(
-            request.json.get("image_path"),
-            request.json.get("output_path"),
-            tuple(request.json.get("size", [256, 256]))
-        )
-    elif task == "convert_md_to_html":
-        return convert_md_to_html(
-            request.json.get("md_path"),
-            request.json.get("output_path")
-        )
+# Business Task Endpoints
+
+@app.post("/fetch_api")
+def fetch_api(url: str, output_path: str):
+    if not is_valid_path(output_path):
+        raise HTTPException(status_code=400, detail="Access outside ./data is not allowed")
+    response = requests.get(url)
+    with open(output_path, "w") as f:
+        f.write(response.text)
+    return {"status": "success", "message": "Data fetched"}
+
+@app.post("/git_commit")
+def git_commit(repo_url: str, commit_message: str):
+    repo_path = "./data/repo"
+    if os.path.exists(repo_path):
+        repo = Repo(repo_path)
     else:
-        return {"error": "Unknown task"}
+        repo = Repo.clone_from(repo_url, repo_path)
+    repo.git.add(all=True)
+    repo.index.commit(commit_message)
+    repo.remote().push()
+    return {"status": "success", "message": "Commit pushed"}
 
-@app.route("/read", methods=["GET"])
-def read_file():
-    """ Read the contents of a file """
-    file_path = request.args.get("path")
-    if not file_path.startswith("./data/"):
-        return {"error": "Unauthorized file access"}, 403
-    try:
-        return send_file(file_path)
-    except FileNotFoundError:
-        return "", 404
+@app.post("/run_sql")
+def run_sql(db_path: str, query: str):
+    if not is_valid_path(db_path):
+        raise HTTPException(status_code=400, detail="Access outside ./data is not allowed")
+    conn = duckdb.connect(db_path)
+    result = conn.execute(query).fetchall()
+    conn.close()
+    return {"status": "success", "result": result}
+
+@app.post("/convert_md")
+def convert_md_to_html(md_path: str, output_path: str):
+    if not is_valid_path(md_path) or not is_valid_path(output_path):
+        raise HTTPException(status_code=400, detail="Access outside ./data is not allowed")
+    with open(md_path, "r") as f:
+        html_content = markdown.markdown(f.read())
+    with open(output_path, "w") as f:
+        f.write(html_content)
+    return {"status": "success", "message": "Markdown converted to HTML"}
+
+@app.post("/transcribe_audio")
+def transcribe_audio(audio_path: str):
+    if not is_valid_path(audio_path):
+        raise HTTPException(status_code=400, detail="Access outside ./data is not allowed")
+    recognizer = sr.Recognizer()
+    with sr.AudioFile(audio_path) as source:
+        audio = recognizer.record(source)
+    transcription = recognizer.recognize_google(audio)
+    return {"status": "success", "transcription": transcription}
+
+@app.post("/resize_image")
+def resize_image(image_path: str, width: int, height: int):
+    if not is_valid_path(image_path):
+        raise HTTPException(status_code=400, detail="Access outside ./data is not allowed")
+    img = Image.open(image_path)
+    resized_img = img.resize((width, height))
+    # Save the resized image to the same path
+    resized_img.save(image_path)
+    return {"status": "success", "message": "Image resized"}
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000)
+
