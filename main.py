@@ -13,7 +13,7 @@ from git import Repo
 app = FastAPI()
 
 # Database path and AI Proxy settings
-db_path = "./data/task_history.db"
+db_path = "/data/task_history.db"
 AIPROXY_URL = "https://aiproxy.sanand.workers.dev/openai/v1/chat/completions"
 AIPROXY_TOKEN = os.getenv("AIPROXY_TOKEN")
 if not AIPROXY_TOKEN:
@@ -36,10 +36,10 @@ def init_db():
 
 init_db()
 
-# Secure path validation to ensure access remains within "./data"
+# Secure path validation to ensure access remains within "/data"
 def is_valid_path(path: str) -> bool:
     abs_path = os.path.abspath(path)
-    allowed_base = os.path.abspath("./data")
+    allowed_base = os.path.abspath("/data")
     return abs_path.startswith(allowed_base)
 
 # Function to execute shell commands safely
@@ -49,9 +49,9 @@ def run_command(command: str):
     if "rm" in tokens or "unlink" in tokens:
         raise HTTPException(status_code=400, detail="File deletion is not allowed")
     
-    # Ensure command accesses only "./data/" by checking tokens individually
-    if not any(token.startswith("./data") for token in tokens):
-        raise HTTPException(status_code=400, detail="Access outside ./data is not allowed")
+    # Ensure command accesses only "/data/" by checking tokens individually
+    if not any(token.startswith("/data") for token in tokens):
+        raise HTTPException(status_code=400, detail="Access outside /data is not allowed")
     
     try:
         result = subprocess.run(command, shell=True, text=True, capture_output=True)
@@ -105,7 +105,7 @@ def run_task(task: str = Query(..., description="Task description in plain Engli
 @app.get("/read")
 def read_file(path: str = Query(..., description="File path to read")):
     if not is_valid_path(path):
-        raise HTTPException(status_code=400, detail="Access outside ./data is not allowed")
+        raise HTTPException(status_code=400, detail="Access outside /data is not allowed")
     
     try:
         if not os.path.exists(path):
@@ -121,7 +121,7 @@ def read_file(path: str = Query(..., description="File path to read")):
 @app.post("/fetch_api")
 def fetch_api(url: str, output_path: str):
     if not is_valid_path(output_path):
-        raise HTTPException(status_code=400, detail="Access outside ./data is not allowed")
+        raise HTTPException(status_code=400, detail="Access outside /data is not allowed")
     response = requests.get(url)
     with open(output_path, "w") as f:
         f.write(response.text)
@@ -129,7 +129,7 @@ def fetch_api(url: str, output_path: str):
 
 @app.post("/git_commit")
 def git_commit(repo_url: str, commit_message: str):
-    repo_path = "./data/repo"
+    repo_path = "/data/repo"
     if os.path.exists(repo_path):
         repo = Repo(repo_path)
     else:
@@ -142,7 +142,7 @@ def git_commit(repo_url: str, commit_message: str):
 @app.post("/run_sql")
 def run_sql(db_path: str, query: str):
     if not is_valid_path(db_path):
-        raise HTTPException(status_code=400, detail="Access outside ./data is not allowed")
+        raise HTTPException(status_code=400, detail="Access outside /data is not allowed")
     conn = duckdb.connect(db_path)
     result = conn.execute(query).fetchall()
     conn.close()
@@ -151,7 +151,7 @@ def run_sql(db_path: str, query: str):
 @app.post("/convert_md")
 def convert_md_to_html(md_path: str, output_path: str):
     if not is_valid_path(md_path) or not is_valid_path(output_path):
-        raise HTTPException(status_code=400, detail="Access outside ./data is not allowed")
+        raise HTTPException(status_code=400, detail="Access outside /data is not allowed")
     with open(md_path, "r") as f:
         html_content = markdown.markdown(f.read())
     with open(output_path, "w") as f:
@@ -161,7 +161,7 @@ def convert_md_to_html(md_path: str, output_path: str):
 @app.post("/transcribe_audio")
 def transcribe_audio(audio_path: str):
     if not is_valid_path(audio_path):
-        raise HTTPException(status_code=400, detail="Access outside ./data is not allowed")
+        raise HTTPException(status_code=400, detail="Access outside /data is not allowed")
     recognizer = sr.Recognizer()
     with sr.AudioFile(audio_path) as source:
         audio = recognizer.record(source)
@@ -171,7 +171,7 @@ def transcribe_audio(audio_path: str):
 @app.post("/resize_image")
 def resize_image(image_path: str, width: int, height: int):
     if not is_valid_path(image_path):
-        raise HTTPException(status_code=400, detail="Access outside ./data is not allowed")
+        raise HTTPException(status_code=400, detail="Access outside /data is not allowed")
     img = Image.open(image_path)
     resized_img = img.resize((width, height))
     # Save the resized image to the same path
